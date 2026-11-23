@@ -1,53 +1,86 @@
 """Hybrid quantum next-character model.
 
-Four characters become four rotation angles, one qubit each. A PennyLane circuit
-turns that into a probability distribution over basis states, and a small linear
-layer reads those probabilities out as next-character logits.
+Each context character gets its own qubit. A learned pair of angles per character
+rotates that qubit (RY then RZ) to a point on the Bloch sphere. A PennyLane circuit
+of strongly entangling layers processes the state, and a linear layer reads one
+Pauli-Z expectation per qubit out as next-character logits. The readout grows with
+the qubit count instead of exponentially, so context is not capped by 2**qubits.
 """
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pennylane as qml
 import torch
 from torch import nn
 
-from qllm.data import window_features
+from qllm.noise import HELIOS_P1, HELIOS_P2, helios_noise_model
 
 
 class QuantumLanguageModel(nn.Module):
-    def __init__(self, context_len: int, n_layers: int, vocab_size: int):
+    def __init__(
+        self,
+        context_len: int,
+        n_layers: int,
+        vocab_size: int,
+        noise: float = 0.0,
+    ):
         super().__init__()
         self.context_len = context_len
         self.n_qubits = context_len
         self.n_layers = n_layers
         self.vocab_size = vocab_size
+        self.noise = noise
+        if noise < 0:
+            raise ValueError("noise must be 0 (noiseless) or a positive scale factor.")
+
+        # Column 0 is the RY angle, column 1 the RZ angle.
+        self.angles = nn.Embedding(vocab_size, 2)
+        with torch.no_grad():
+            self.angles.weight[:, 0].uniform_(0.0, math.pi)
+            self.angles.weight[:, 1].uniform_(0.0, 2 * math.pi)
 
         shape = qml.StronglyEntanglingLayers.shape(n_layers=n_layers, n_wires=self.n_qubits)
         self.weights = nn.Parameter(0.1 * torch.randn(*shape))
-        self.readout = nn.Linear(2**self.n_qubits, vocab_size)
+        self.readout = nn.Linear(self.n_qubits, vocab_size)
 
         wires = list(range(self.n_qubits))
-        device = qml.device("default.qubit", wires=self.n_qubits)
 
-        def circuit(features: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-            # features: (batch, n_qubits), one angle per context character
-            qml.AngleEmbedding(features, wires=wires, rotation="Y")
+        def circuit(theta: torch.Tensor, phi: torch.Tensor, weights: torch.Tensor):
+            # theta, phi: (batch, n_qubits), one angle pair per context character
+            qml.AngleEmbedding(theta, wires=wires, rotation="Y")
+            qml.AngleEmbedding(phi, wires=wires, rotation="Z")
             qml.StronglyEntanglingLayers(weights, wires=wires)
-            return qml.probs(wires=wires)
+            return tuple(qml.expval(qml.PauliZ(wire)) for wire in wires)
 
-        self.circuit = qml.QNode(circuit, device, interface="torch", diff_method="backprop")
+        if noise == 0.0:
+            device = qml.device("default.qubit", wires=self.n_qubits)
+            self.circuit = qml.QNode(circuit, device, interface="torch", diff_method="backprop")
+        else:
+            # Depolarizing noise needs density matrices and parameter-shift
+            # gradients, so noisy runs are far slower. Train noiseless by default.
+            device = qml.device("default.mixed", wires=self.n_qubits)
+            base = qml.QNode(circuit, device, interface="torch", diff_method="best")
+            self.circuit = qml.add_noise(
+                base,
+                helios_noise_model(p1=HELIOS_P1 * noise, p2=HELIOS_P2 * noise),
+            )
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """Return logits over the vocabulary. Shape (batch, vocab_size)."""
-        probabilities = self.circuit(features, self.weights)
-        return self.readout(probabilities.float())
+    def forward(self, char_ids: torch.Tensor) -> torch.Tensor:
+        """Map (batch, context_len) character ids to (batch, vocab_size) logits."""
+        angles = self.angles(char_ids)
+        raw = self.circuit(angles[..., 0], angles[..., 1], self.weights)
+        expectations = torch.stack(list(raw), dim=-1).float()
+        return self.readout(expectations)
 
-    def parameter_count(self) -> tuple[int, int]:
+    def parameter_count(self) -> tuple[int, int, int]:
+        """Return (embedding, quantum, readout) parameter counts."""
+        embedding = int(self.angles.weight.numel())
         quantum = int(self.weights.numel())
-        classical = sum(parameter.numel() for parameter in self.readout.parameters())
-        return quantum, int(classical)
+        readout = sum(parameter.numel() for parameter in self.readout.parameters())
+        return embedding, quantum, int(readout)
 
 
 @torch.no_grad()
@@ -75,9 +108,8 @@ def generate(
 
     pieces: list[str] = []
     for _ in range(length):
-        window = ids[-model.context_len :]
-        features = window_features(window, model.vocab_size)
-        logits = model(features)[0]
+        window = torch.tensor([ids[-model.context_len :]], dtype=torch.long)
+        logits = model(window)[0]
         if greedy:
             nxt = int(torch.argmax(logits).item())
         else:
@@ -103,6 +135,8 @@ def save_checkpoint(
             "n_layers": model.n_layers,
             "context_len": model.context_len,
             "vocab_size": model.vocab_size,
+            "readout_kind": "expval-z",
+            "noise": model.noise,
         },
         path,
     )
@@ -110,10 +144,16 @@ def save_checkpoint(
 
 def load_model(path: Path) -> tuple[QuantumLanguageModel, dict[str, int], list[str]]:
     payload = torch.load(path, map_location="cpu", weights_only=False)
+    if payload.get("readout_kind", "probs") != "expval-z":
+        raise ValueError(
+            "This checkpoint uses the old 2**qubits probs readout and cannot load "
+            "into the expval readout. Retrain to produce a new checkpoint."
+        )
     model = QuantumLanguageModel(
         context_len=payload["context_len"],
         n_layers=payload["n_layers"],
         vocab_size=payload["vocab_size"],
+        noise=payload.get("noise", 0.0),
     )
     model.load_state_dict(payload["state_dict"])
     model.eval()
