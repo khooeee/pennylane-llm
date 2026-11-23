@@ -23,7 +23,7 @@ class HeliosTests(unittest.TestCase):
     @torch.no_grad()
     def test_full_width_program_reports_one_bit_per_qubit(self):
         width = 98
-        model = QuantumLanguageModel(width, 4, 10, runner=HeliosRunner(1))
+        model = QuantumLanguageModel(width, 4, 10, runner=HeliosRunner(1), ansatz="brickwork")
         angles = torch.linspace(0.0, 1.0, width)
         tape = model.make_tape(angles, angles, model.weights)
         result = (
@@ -42,9 +42,11 @@ class HeliosTests(unittest.TestCase):
         from hugr.qsystem.result import QsysResult
 
         runner = HeliosRunner(2, project="qllm-test", system="Helios-1E", max_cost=0.5)
-        model = QuantumLanguageModel(2, 1, 2, runner=runner)
-        tape = model.make_tape(torch.zeros(2), torch.zeros(2), model.weights)
-        result = QsysResult([[("bits", [0, 1])], [("bits", [1, 1])]])
+        width = 98
+        model = QuantumLanguageModel(width, 4, 2, runner=runner, ansatz="brickwork")
+        angles = torch.zeros(width)
+        tape = model.make_tape(angles, angles, model.weights)
+        result = QsysResult([[("bits", [0, 1] * 49)], [("bits", [1] * width)]])
         with (
             patch.object(qnx.projects, "get_or_create"),
             patch.object(qnx.hugr, "upload"),
@@ -59,8 +61,11 @@ class HeliosTests(unittest.TestCase):
             submit.assert_not_called()
 
             estimate.return_value = [(0.25, 1.0)]
-            torch.testing.assert_close(runner([tape]), torch.tensor([[0.0, -1.0]]))
+            expected = torch.tensor([[0.0, -1.0] * 49])
+            torch.testing.assert_close(runner([tape]), expected)
             kwargs = submit.call_args.kwargs
             self.assertEqual(kwargs["backend_config"].system_name, "Helios-1E")
-            self.assertEqual(kwargs["n_qubits"], 2)
+            simulator = kwargs["backend_config"].emulator_config.simulator
+            self.assertIsInstance(simulator, qnx.models.MatrixProductStateSimulator)
+            self.assertEqual(kwargs["n_qubits"], width)
             self.assertEqual(kwargs["max_cost"], [0.25])

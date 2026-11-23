@@ -31,9 +31,11 @@ def evaluate(
     model: QuantumLanguageModel,
     inputs: torch.Tensor,
     targets: torch.Tensor,
+    batch_size: int | None = None,
 ) -> tuple[float, float]:
     """Return (loss, accuracy)."""
-    logits = model(inputs)
+    batches = (inputs,) if batch_size is None else inputs.split(batch_size)
+    logits = torch.cat([model(batch) for batch in batches])
     loss = F.cross_entropy(logits, targets).item()
     accuracy = (torch.argmax(logits, dim=-1) == targets).float().mean().item()
     return float(loss), float(accuracy)
@@ -43,11 +45,20 @@ def train(args: argparse.Namespace) -> None:
     check_context(args.context)
     if args.steps < 1:
         raise ValueError("steps must be at least 1.")
+    brickwork = args.ansatz == "brickwork"
+    batch_size = args.batch_size
+    if batch_size is None:
+        batch_size = (1 if args.noise else 8) if brickwork else 256
+    window_count = args.eval_windows
+    if window_count is None:
+        window_count = 128 if brickwork else 4096
+    if batch_size < 1 or window_count < 1:
+        raise ValueError("batch size and evaluation window count must be positive.")
     text = load_text(args.corpus)
     stoi, itos = build_vocab(text)
     ids = encode(text, stoi)
     train_ids, val_ids = split_ids(ids, args.context, args.val_fraction)
-    val_set = eval_windows(val_ids, args.context, args.eval_windows) if len(val_ids) else None
+    val_set = eval_windows(val_ids, args.context, window_count) if len(val_ids) else None
 
     torch.manual_seed(args.seed)
     model = QuantumLanguageModel(
@@ -55,6 +66,7 @@ def train(args: argparse.Namespace) -> None:
         n_layers=args.layers,
         vocab_size=len(itos),
         noise=args.noise,
+        ansatz=args.ansatz,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.steps)
@@ -65,7 +77,7 @@ def train(args: argparse.Namespace) -> None:
         f"val={len(val_ids):,} symbols={len(itos)}"
     )
     print(
-        f"qubits={model.n_qubits} layers={args.layers} noise={args.noise} "
+        f"qubits={model.n_qubits} layers={args.layers} ansatz={model.ansatz} noise={args.noise} "
         f"embedding_parameters={embedding_params} quantum_parameters={quantum_params} "
         f"readout_parameters={readout_params}"
     )
@@ -76,7 +88,7 @@ def train(args: argparse.Namespace) -> None:
     running_steps = 0
     model.train()
     for step in range(1, args.steps + 1):
-        inputs, targets = random_batch(train_ids, args.context, args.batch_size)
+        inputs, targets = random_batch(train_ids, args.context, batch_size)
         optimizer.zero_grad()
         loss = F.cross_entropy(model(inputs), targets)
         loss.backward()
@@ -88,7 +100,9 @@ def train(args: argparse.Namespace) -> None:
         if step == 1 or step % args.eval_every == 0 or step == args.steps:
             line = f"step {step:5d}  train {running_loss / running_steps:.4f}"
             if val_set is not None:
-                val_loss, val_acc = evaluate(model, *val_set)
+                val_loss, val_acc = evaluate(
+                    model, *val_set, batch_size=batch_size if brickwork else None
+                )
                 line += f"  val {val_loss:.4f}  val_acc {val_acc:.1%}"
             print(f"{line}  ({time.time() - started:.0f}s)", flush=True)
             running_loss = 0.0
@@ -123,13 +137,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--context", type=int, default=6)
     parser.add_argument("--layers", type=int, default=4)
+    parser.add_argument(
+        "--ansatz", choices=["strong", "brickwork"], default="strong",
+        help="Use brickwork to train shallow circuits at Helios width.",
+    )
     parser.add_argument("--steps", type=int, default=250)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument(
+        "--batch-size", type=int,
+        help="Defaults to 256 for strong, 8 for noiseless brickwork, and 1 for noisy brickwork.",
+    )
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument("--noise", type=float, default=0.0)
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--eval-every", type=int, default=500)
-    parser.add_argument("--eval-windows", type=int, default=4096)
+    parser.add_argument("--eval-windows", type=int, help="Defaults to 4096 for strong and 128 for brickwork.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--prompt", default="the ")
     parser.add_argument("--sample-length", type=int, default=200)

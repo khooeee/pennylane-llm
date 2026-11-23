@@ -9,6 +9,10 @@ import pennylane as qml
 import torch
 
 
+# Selene's statevector simulator supports up to 32 qubits.
+STATEVECTOR_LIMIT = 32
+
+
 class HeliosRunner:
     def __init__(
         self,
@@ -81,6 +85,8 @@ class HeliosRunner:
     def __call__(self, tapes: list[qml.tape.QuantumScript]) -> torch.Tensor:
         width = len(tapes[0].wires)
         if self.system is None:
+            if width > STATEVECTOR_LIMIT:
+                raise ValueError("For more than 32 qubits, use ideal evaluation or a Nexus target.")
             results = [
                 self.program(tape)
                 .emulator(n_qubits=width)
@@ -119,9 +125,17 @@ class HeliosRunner:
         ]
         shots = [self.shots] * len(programs)
         emulating = system == "Helios-1E"
+        emulator_config = None
+        if emulating:
+            simulator = (
+                qnx.models.MatrixProductStateSimulator(chi=64)
+                if width > STATEVECTOR_LIMIT
+                else qnx.models.StatevectorSimulator()
+            )
+            emulator_config = qnx.models.HeliosEmulatorConfig(simulator=simulator)
         config = qnx.models.HeliosConfig(
             system_name=system,
-            emulator_config=qnx.models.HeliosEmulatorConfig() if emulating else None,
+            emulator_config=emulator_config,
         )
         estimates = qnx.hugr.cost_confidence(
             programs, shots, project=project, system_name="Helios-1" if emulating else system

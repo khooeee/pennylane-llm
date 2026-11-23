@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 artifacts/expval-model.pt
+artifacts/shakespeare-98.pt

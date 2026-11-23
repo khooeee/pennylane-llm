@@ -2,7 +2,7 @@
 
 Each context character gets its own qubit. A learned pair of angles per character
 rotates that qubit (RY then RZ) to a point on the Bloch sphere. A PennyLane circuit
-of strongly entangling layers processes the state, and a linear layer reads one
+of parameterized layers processes the state, and a linear layer reads one
 Pauli-Z expectation per qubit out as next-character logits. The readout grows with
 the qubit count instead of exponentially, so context is not capped by 2**qubits.
 """
@@ -17,6 +17,7 @@ import pennylane as qml
 import torch
 from torch import nn
 
+from qllm.brickwork import BrickworkCircuit
 from qllm.data import check_context
 from qllm.noise import helios_noise_model
 
@@ -33,6 +34,7 @@ class QuantumLanguageModel(nn.Module):
         *,
         runner: CircuitRunner | None = None,
         readout_kind: str = "expval-z",
+        ansatz: str = "strong",
     ):
         super().__init__()
         check_context(context_len)
@@ -43,12 +45,17 @@ class QuantumLanguageModel(nn.Module):
         self.noise = noise
         self.runner = runner
         self.readout_kind = readout_kind
+        self.ansatz = ansatz
         if readout_kind not in {"expval-z", "probs"}:
             raise ValueError(f"Unknown checkpoint readout: {readout_kind}")
         if readout_kind == "probs" and (runner is not None or noise != 0):
             raise ValueError("Train a Pauli-Z checkpoint for Helios or noisy evaluation.")
         if readout_kind == "probs" and context_len > 8:
             raise ValueError("The legacy probability checkpoint supports up to 8 qubits.")
+        if ansatz not in {"strong", "brickwork"}:
+            raise ValueError(f"Unknown circuit layout: {ansatz}")
+        if readout_kind == "probs" and ansatz != "strong":
+            raise ValueError("The legacy probability checkpoint requires the strong ansatz.")
         if runner is not None and noise != 0:
             raise ValueError("The circuit runner sets its own noise model.")
 
@@ -59,7 +66,7 @@ class QuantumLanguageModel(nn.Module):
                 self.angles.weight[:, 0].uniform_(0.0, math.pi)
                 self.angles.weight[:, 1].uniform_(0.0, 2 * math.pi)
 
-        shape = qml.StronglyEntanglingLayers.shape(n_layers=n_layers, n_wires=self.n_qubits)
+        shape = (n_layers, self.n_qubits, 3)
         self.weights = nn.Parameter(0.1 * torch.randn(*shape))
         feature_count = self.n_qubits if self.angles is not None else 2**self.n_qubits
         self.readout = nn.Linear(feature_count, vocab_size)
@@ -76,17 +83,23 @@ class QuantumLanguageModel(nn.Module):
                 return qml.probs(wires=wires)
             return tuple(qml.expval(qml.PauliZ(wire)) for wire in wires)
 
-        self.make_tape = qml.tape.make_qscript(circuit)
-        if runner is not None:
-            return
-        if noise == 0.0:
-            device = qml.device("default.qubit", wires=self.n_qubits)
-            self.circuit = qml.QNode(circuit, device, interface="torch", diff_method="backprop")
-        else:
-            # Density matrices make noisy runs much more expensive than noiseless runs.
-            device = qml.device("default.mixed", wires=self.n_qubits)
-            base = qml.QNode(circuit, device, interface="torch", diff_method="best")
-            self.circuit = qml.add_noise(base, helios_noise_model(noise))
+        brickwork = BrickworkCircuit(self.n_qubits, n_layers) if ansatz == "brickwork" else None
+        full_circuit = brickwork.full.circuit if brickwork is not None else circuit
+        self.make_tape = qml.tape.make_qscript(full_circuit)
+        if runner is None:
+            if brickwork is None:
+                self.circuit = self._local_node(circuit, self.n_qubits)
+            else:
+                self.circuit = brickwork.simulator(self._local_node)
+
+    def _local_node(self, circuit: Callable, width: int) -> qml.QNode:
+        if self.noise == 0.0:
+            device = qml.device("default.qubit", wires=width)
+            return qml.QNode(circuit, device, interface="torch", diff_method="backprop")
+        # Density matrices make noisy runs much more expensive than noiseless runs.
+        device = qml.device("default.mixed", wires=width)
+        base = qml.QNode(circuit, device, interface="torch", diff_method="best")
+        return qml.add_noise(base, helios_noise_model(self.noise))
 
     def forward(self, char_ids: torch.Tensor) -> torch.Tensor:
         """Map (batch, context_len) character ids to (batch, vocab_size) logits."""
@@ -96,9 +109,11 @@ class QuantumLanguageModel(nn.Module):
         angles = self.angles(char_ids)
         if self.runner is not None:
             tapes = [self.make_tape(row[:, 0], row[:, 1], self.weights) for row in angles]
-            return self.readout(self.runner(tapes).to(self.readout.weight))
-        raw = self.circuit(angles[..., 0], angles[..., 1], self.weights)
-        return self.readout(torch.stack(raw, dim=-1).float())
+            expectations = self.runner(tapes)
+        else:
+            result = self.circuit(angles[..., 0], angles[..., 1], self.weights)
+            expectations = result if self.ansatz == "brickwork" else torch.stack(result, dim=-1)
+        return self.readout(expectations.to(self.readout.weight))
 
     def parameter_count(self) -> tuple[int, int, int]:
         """Return (embedding, quantum, readout) parameter counts."""
@@ -161,6 +176,7 @@ def save_checkpoint(
             "context_len": model.context_len,
             "vocab_size": model.vocab_size,
             "readout_kind": model.readout_kind,
+            "ansatz": model.ansatz,
             "noise": model.noise,
         },
         path,
@@ -181,6 +197,7 @@ def load_model(
         noise=payload.get("noise", 0.0) if noise is None else noise,
         runner=runner,
         readout_kind=payload.get("readout_kind", "probs"),
+        ansatz=payload.get("ansatz", "strong"),
     )
     model.load_state_dict(payload["state_dict"])
     model.eval()

@@ -7,12 +7,11 @@ import math
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 
 from qllm.data import DEFAULT_CORPUS, encode, eval_windows, load_text, split_ids
 from qllm.helios import HeliosRunner
 from qllm.model import load_model
-from qllm.train import DEFAULT_CHECKPOINT
+from qllm.train import DEFAULT_CHECKPOINT, evaluate
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,9 +59,10 @@ def main() -> None:
     if len(val_ids) <= model.context_len:
         raise SystemExit("The validation split is too short for this checkpoint.")
     inputs, targets = eval_windows(val_ids, model.context_len, args.windows, seed=args.seed)
-    logits = model(inputs)
-    loss = F.cross_entropy(logits, targets).item()
-    accuracy = (logits.argmax(dim=1) == targets).float().mean().item()
+    batch_size = None
+    if runner is None and model.ansatz == "brickwork":
+        batch_size = 1 if model.noise else 8
+    loss, accuracy = evaluate(model, inputs, targets, batch_size=batch_size)
     backend = args.system if args.backend == "nexus" else args.backend
     shots = f" shots_per_window={args.shots}" if runner is not None else ""
     print(f"backend={backend} qubits={model.n_qubits} windows={len(targets)}{shots}")
