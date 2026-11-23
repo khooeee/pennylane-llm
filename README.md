@@ -1,83 +1,53 @@
 # pennylane-llm
 
-A toy character-level language model whose forward pass is a PennyLane circuit, trained on Shakespeare.
+A toy character-level language model with a PennyLane circuit. It encodes each character on one qubit using learned RY and RZ rotations, applies strongly entangling layers, and maps one Pauli-Z expectation per qubit to next-character logits. The readout grows linearly with context length.
 
-Each character in a short context window gets its own qubit. Every character in the alphabet has a learned pair of angles that rotates its qubit (RY, then RZ) to a point on the Bloch sphere. A stack of strongly entangling layers processes that state, and a linear layer reads one Pauli-Z expectation per qubit out as next-character logits. Training is cross-entropy on random minibatches with Adam and a cosine learning-rate schedule; gradients flow through the simulated circuit with PennyLane's PyTorch interface.
+## Train and sample
 
-The default corpus is [Tiny Shakespeare](https://github.com/karpathy/char-rnn/tree/master/data/tinyshakespeare) (`data/shakespeare.txt`, about 1.1M characters, 65 symbols). The last 10% is held out for validation. `data/cats.txt` is the original four-line toy corpus.
-
-## What to expect
-
-With the defaults (6 qubits, 4 layers, about 0.7k parameters) training takes about two minutes on a laptop CPU and reaches a validation loss of roughly 2.49 nats per character. For reference:
-
-| Model | Loss (nats/char) |
-| --- | --- |
-| Uniform guess over 65 symbols | 4.17 |
-| Character frequencies only (unigram) | 3.31 |
-| Fixed angle encoding (the original model) | ~2.85 |
-| **This model, defaults** | **~2.49** |
-| Bigram count table (measured on its own training text) | 2.45 |
-
-So it learns roughly bigram-level statistics: common letters, word lengths, spacing, and capitalised speaker names. The output looks like this:
-
-```
-ROMEO:
-Thaten thes mol hos sorr an thet heil ans be thele as iut sonl than; to mear cos hives ans wa a ronr loth bot sor rurt a nate the siv siu uat lu soun sone thar
-```
-
-Loss figures above were measured with the previous 2**qubits probs readout; re-run training to refresh them for the expval readout. The readout now grows linearly with context, so `--context` is allowed up to 98 (Helios size). Simulation memory still doubles with each extra qubit, so local training is practical to roughly 20 qubits; 98-qubit runs target real Helios hardware or a tensor-network backend.
-
-## Setup
-
-Requires [uv](https://docs.astral.sh/uv/) and Python 3.11.
+Install with [uv](https://docs.astral.sh/uv/). Local training supports Python 3.11 and newer.
 
 ```bash
 uv sync
-```
-
-## Train
-
-```bash
 uv run python -m qllm.train
+uv run python -m qllm.sample --prompt "the " --length 40
 ```
 
-This trains on `data/shakespeare.txt` for 5000 steps, logging train and validation loss every 500 steps, and writes `artifacts/model.pt`. At the end it prints a greedy continuation and a sample at temperature 0.5.
+The default corpus is the bundled 92-character toy text. Training holds out its last 10% and saves `artifacts/expval-model.pt`. Sampling also supports the bundled original checkpoint, `artifacts/model.pt`. Train a Pauli-Z checkpoint to use the Helios backends.
 
-To train on the toy corpus instead:
+For a longer corpus such as [Tiny Shakespeare](https://github.com/karpathy/char-rnn/tree/master/data/tinyshakespeare), provide its path and a prompt from its vocabulary.
 
 ```bash
-uv run python -m qllm.train --corpus data/cats.txt --context 4 --steps 300 --lr 0.05 --val-fraction 0 --prompt "the "
+uv run python -m qllm.train --corpus path/to/shakespeare.txt --context 6 --steps 5000
 ```
 
-To evaluate under Helios-like depolarizing noise (much slower, mixed-state simulator):
+## Measure noise and run on Helios
+
+Compare cross-entropy in nats per character and next-character accuracy across backends. Use the same checkpoint, corpus, validation fraction, window count and seed for each run. For a meaningful comparison, use a larger held-out set than the toy corpus provides.
 
 ```bash
-uv run python -m qllm.train --corpus data/cats.txt --context 4 --steps 10 --noise 1.0 --val-fraction 0 --prompt "the "
+uv run python -m qllm.evaluate --backend ideal
+uv run python -m qllm.evaluate --backend local-noise
+
+uv sync --python 3.12 --extra helios
+uv run --python 3.12 --extra helios python -m qllm.evaluate --backend selene --shots 1024
 ```
 
-`--noise 1.0` matches the Helios-1E emulator fault rates; `0` (the default) trains noiseless.
+- `ideal` computes exact Z expectations with PennyLane.
+- `local-noise` adds a one-qubit or joint two-qubit depolarizing channel at each corresponding gate. It uses published average gate infidelities of 0.0025% and 0.079%, converted to Pauli-error probabilities. This approximation covers gate noise. Set `--noise 1` on training to use the same approximation during training. [Helios benchmark](https://www.nature.com/articles/s41586-026-10676-4)
+- `selene` runs the exported Guppy circuit locally with finite shots. Each shot measures every qubit in the Z basis.
+- `nexus` runs the same Guppy circuits on the Helios-1E noisy emulator or on Helios hardware. Helios-1E includes preparation, measurement, leakage, and memory noise. [Quantinuum noise model](https://docs.quantinuum.com/systems/user_guide/emulator_user_guide/noise_model.html)
 
-Useful flags:
-
-| Flag | Default | Meaning |
-| --- | --- | --- |
-| `--context` | `6` | Characters (and qubits) of context. Allowed 1–98; local simulation is only practical for small values. |
-| `--layers` | `4` | Strongly entangling layers. |
-| `--steps` | `5000` | Optimiser steps. |
-| `--batch-size` | `256` | Windows per step. |
-| `--lr` | `0.1` | Peak Adam learning rate (cosine-decayed to 0). |
-| `--noise` | `0.0` | Helios noise scale. `0` noiseless, `1` Helios-1E fidelity. Noisy runs use the mixed-state simulator and train much slower. |
-| `--val-fraction` | `0.1` | Tail of the corpus held out for validation. `0` disables it. |
-| `--eval-every` | `500` | Steps between validation reports. |
-| `--prompt` | `ROMEO:\n` | Prompt used for the samples printed after training. |
-| `--corpus` | `data/shakespeare.txt` | Training text. The alphabet is every character that appears in this file. |
-| `--checkpoint` | `artifacts/model.pt` | Where to save the model. |
-
-## Sample
+Sign in to Nexus from the Python environment and use an accessible project. Nexus estimates costs before execution. Pass `--max-cost` to cap the total estimate in HQC. Choose `--system Helios-1` or `--system Helios-2` to run on hardware your organization can access. [Quantinuum’s Nexus workflow](https://docs.quantinuum.com/workflows/run-on-helios/)
 
 ```bash
-uv run python -m qllm.sample --prompt "JULIET:
-"
+uv run --python 3.12 --extra helios python -m qllm.evaluate \
+  --backend nexus --system Helios-1E --project my-project --windows 4 --shots 1024
 ```
 
-`--greedy` picks the most likely next character (with this small a model it quickly loops on "the the the"). Otherwise sampling uses `--temperature` (default `0.5`). The prompt may only contain characters from the training corpus.
+Helios has 98 fully connected physical qubits, so a context of up to 98 characters fits the inference circuit. Four layers at that width use 392 CNOTs before native compilation. Exact statevector and density-matrix simulation grow exponentially in memory. Start with a small checkpoint for local simulation and Helios-1E. The 98-qubit test compiles and exercises the circuit's measurement output using Selene's coin-flip simulator. A hardware accuracy measurement requires a Nexus run.
+
+Run the Guppy parity and width tests locally with the Helios extra installed.
+
+```bash
+uv run --python 3.12 --extra helios python -m unittest discover -s tests -v
+```

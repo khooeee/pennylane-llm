@@ -10,13 +10,17 @@ the qubit count instead of exponentially, so context is not capped by 2**qubits.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from pathlib import Path
 
 import pennylane as qml
 import torch
 from torch import nn
 
-from qllm.noise import HELIOS_P1, HELIOS_P2, helios_noise_model
+from qllm.data import check_context
+from qllm.noise import helios_noise_model
+
+CircuitRunner = Callable[[list[qml.tape.QuantumScript]], torch.Tensor]
 
 
 class QuantumLanguageModel(nn.Module):
@@ -26,58 +30,79 @@ class QuantumLanguageModel(nn.Module):
         n_layers: int,
         vocab_size: int,
         noise: float = 0.0,
+        *,
+        runner: CircuitRunner | None = None,
+        readout_kind: str = "expval-z",
     ):
         super().__init__()
+        check_context(context_len)
         self.context_len = context_len
         self.n_qubits = context_len
         self.n_layers = n_layers
         self.vocab_size = vocab_size
         self.noise = noise
-        if noise < 0:
-            raise ValueError("noise must be 0 (noiseless) or a positive scale factor.")
+        self.runner = runner
+        self.readout_kind = readout_kind
+        if readout_kind not in {"expval-z", "probs"}:
+            raise ValueError(f"Unknown checkpoint readout: {readout_kind}")
+        if readout_kind == "probs" and (runner is not None or noise != 0):
+            raise ValueError("Train a Pauli-Z checkpoint for Helios or noisy evaluation.")
+        if readout_kind == "probs" and context_len > 8:
+            raise ValueError("The legacy probability checkpoint supports up to 8 qubits.")
+        if runner is not None and noise != 0:
+            raise ValueError("The circuit runner sets its own noise model.")
 
-        # Column 0 is the RY angle, column 1 the RZ angle.
-        self.angles = nn.Embedding(vocab_size, 2)
-        with torch.no_grad():
-            self.angles.weight[:, 0].uniform_(0.0, math.pi)
-            self.angles.weight[:, 1].uniform_(0.0, 2 * math.pi)
+        self.angles = None
+        if readout_kind == "expval-z":
+            self.angles = nn.Embedding(vocab_size, 2)
+            with torch.no_grad():
+                self.angles.weight[:, 0].uniform_(0.0, math.pi)
+                self.angles.weight[:, 1].uniform_(0.0, 2 * math.pi)
 
         shape = qml.StronglyEntanglingLayers.shape(n_layers=n_layers, n_wires=self.n_qubits)
         self.weights = nn.Parameter(0.1 * torch.randn(*shape))
-        self.readout = nn.Linear(self.n_qubits, vocab_size)
+        feature_count = self.n_qubits if self.angles is not None else 2**self.n_qubits
+        self.readout = nn.Linear(feature_count, vocab_size)
 
         wires = list(range(self.n_qubits))
 
         def circuit(theta: torch.Tensor, phi: torch.Tensor, weights: torch.Tensor):
             # theta, phi: (batch, n_qubits), one angle pair per context character
             qml.AngleEmbedding(theta, wires=wires, rotation="Y")
-            qml.AngleEmbedding(phi, wires=wires, rotation="Z")
+            if self.angles is not None:
+                qml.AngleEmbedding(phi, wires=wires, rotation="Z")
             qml.StronglyEntanglingLayers(weights, wires=wires)
+            if self.angles is None:
+                return qml.probs(wires=wires)
             return tuple(qml.expval(qml.PauliZ(wire)) for wire in wires)
 
+        self.make_tape = qml.tape.make_qscript(circuit)
+        if runner is not None:
+            return
         if noise == 0.0:
             device = qml.device("default.qubit", wires=self.n_qubits)
             self.circuit = qml.QNode(circuit, device, interface="torch", diff_method="backprop")
         else:
-            # Depolarizing noise needs density matrices and parameter-shift
-            # gradients, so noisy runs are far slower. Train noiseless by default.
+            # Density matrices make noisy runs much more expensive than noiseless runs.
             device = qml.device("default.mixed", wires=self.n_qubits)
             base = qml.QNode(circuit, device, interface="torch", diff_method="best")
-            self.circuit = qml.add_noise(
-                base,
-                helios_noise_model(p1=HELIOS_P1 * noise, p2=HELIOS_P2 * noise),
-            )
+            self.circuit = qml.add_noise(base, helios_noise_model(noise))
 
     def forward(self, char_ids: torch.Tensor) -> torch.Tensor:
         """Map (batch, context_len) character ids to (batch, vocab_size) logits."""
+        if self.angles is None:
+            theta = (math.pi * (char_ids.double() + 0.5) / self.vocab_size).float()
+            return self.readout(self.circuit(theta, theta, self.weights).float())
         angles = self.angles(char_ids)
+        if self.runner is not None:
+            tapes = [self.make_tape(row[:, 0], row[:, 1], self.weights) for row in angles]
+            return self.readout(self.runner(tapes).to(self.readout.weight))
         raw = self.circuit(angles[..., 0], angles[..., 1], self.weights)
-        expectations = torch.stack(list(raw), dim=-1).float()
-        return self.readout(expectations)
+        return self.readout(torch.stack(raw, dim=-1).float())
 
     def parameter_count(self) -> tuple[int, int, int]:
         """Return (embedding, quantum, readout) parameter counts."""
-        embedding = int(self.angles.weight.numel())
+        embedding = 0 if self.angles is None else self.angles.weight.numel()
         quantum = int(self.weights.numel())
         readout = sum(parameter.numel() for parameter in self.readout.parameters())
         return embedding, quantum, int(readout)
@@ -135,25 +160,27 @@ def save_checkpoint(
             "n_layers": model.n_layers,
             "context_len": model.context_len,
             "vocab_size": model.vocab_size,
-            "readout_kind": "expval-z",
+            "readout_kind": model.readout_kind,
             "noise": model.noise,
         },
         path,
     )
 
 
-def load_model(path: Path) -> tuple[QuantumLanguageModel, dict[str, int], list[str]]:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
-    if payload.get("readout_kind", "probs") != "expval-z":
-        raise ValueError(
-            "This checkpoint uses the old 2**qubits probs readout and cannot load "
-            "into the expval readout. Retrain to produce a new checkpoint."
-        )
+def load_model(
+    path: Path,
+    *,
+    noise: float | None = None,
+    runner: CircuitRunner | None = None,
+) -> tuple[QuantumLanguageModel, dict[str, int], list[str]]:
+    payload = torch.load(path, map_location="cpu", weights_only=True)
     model = QuantumLanguageModel(
         context_len=payload["context_len"],
         n_layers=payload["n_layers"],
         vocab_size=payload["vocab_size"],
-        noise=payload.get("noise", 0.0),
+        noise=payload.get("noise", 0.0) if noise is None else noise,
+        runner=runner,
+        readout_kind=payload.get("readout_kind", "probs"),
     )
     model.load_state_dict(payload["state_dict"])
     model.eval()

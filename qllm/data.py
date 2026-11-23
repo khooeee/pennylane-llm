@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CORPUS = ROOT / "data" / "shakespeare.txt"
+DEFAULT_CORPUS = ROOT / "data" / "corpus.txt"
 # Upper bound is Helios (98 qubits). Simulation memory still doubles per qubit,
 # so only small contexts are practical on a local simulator.
 MAX_CONTEXT = 98

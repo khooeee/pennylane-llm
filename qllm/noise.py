@@ -1,29 +1,37 @@
-"""Helios-like depolarizing noise for the quantum language model.
-
-Defaults mirror the Quantinuum Helios-1E emulator: 2.5e-05 single-qubit fault
-probability and 0.0008 two-qubit fault probability.
-"""
+"""Local depolarizing approximation of Helios's physical gate infidelities."""
 
 from __future__ import annotations
 
+import math
+from itertools import product
+
+import numpy as np
 import pennylane as qml
 from pennylane.noise import NoiseModel, op_eq
 
-HELIOS_P1 = 2.5e-05
-HELIOS_P2 = 0.0008
+ONE_QUBIT_INFIDELITY = 2.5e-5
+TWO_QUBIT_INFIDELITY = 7.9e-4
 
 
-def helios_noise_model(p1: float = HELIOS_P1, p2: float = HELIOS_P2) -> NoiseModel:
-    """Return a depolarizing noise model at the given fault probabilities."""
-    if p1 < 0 or p2 < 0:
-        raise ValueError("fault probabilities must be non-negative.")
+def helios_noise_model(scale: float) -> NoiseModel:
+    """Convert average gate infidelity to uniform non-identity Pauli error."""
+    p1 = 1.5 * ONE_QUBIT_INFIDELITY * scale
+    p2 = 1.25 * TWO_QUBIT_INFIDELITY * scale
+    if not math.isfinite(scale) or not 0 <= p1 <= 1 or not 0 <= p2 <= 1:
+        raise ValueError("noise scale must give finite Pauli error probabilities in [0, 1].")
+
+    paulis = [qml.matrix(gate(0)) for gate in (qml.Identity, qml.X, qml.Y, qml.Z)]
+    kraus = [math.sqrt(1 - p2) * np.eye(4)]
+    kraus.extend(
+        math.sqrt(p2 / 15) * np.kron(left, right)
+        for left, right in list(product(paulis, repeat=2))[1:]
+    )
 
     def _after_single(op, **kwargs) -> None:
         qml.DepolarizingChannel(p1, wires=op.wires)
 
     def _after_cnot(op, **kwargs) -> None:
-        for wire in op.wires:
-            qml.DepolarizingChannel(p2, wires=wire)
+        qml.QubitChannel(kraus, wires=op.wires)
 
     return NoiseModel(
         {

@@ -4,8 +4,16 @@ version = "0.1.0"
 description = "A toy character-level language model whose forward pass is a PennyLane circuit."
 requires-python = ">=3.11"
 dependencies = [
-    "pennylane>=0.41",
+    "numpy>=1.26",
+    "pennylane>=0.45,<0.46",
     "torch>=2.2",
+]
+
+[project.optional-dependencies]
+helios = [
+    "guppylang>=1.2.2,<1.3; python_version >= '3.12'",
+    "pytket>=2.18.5,<2.19; python_version >= '3.12'",
+    "qnexus>=0.51.4,<0.52; python_version >= '3.12'",
 ]
 
 [tool.uv]

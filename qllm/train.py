@@ -23,7 +23,7 @@ from qllm.data import (
 )
 from qllm.model import QuantumLanguageModel, generate, save_checkpoint
 
-DEFAULT_CHECKPOINT = ROOT / "artifacts" / "model.pt"
+DEFAULT_CHECKPOINT = ROOT / "artifacts" / "expval-model.pt"
 
 
 @torch.no_grad()
@@ -123,7 +123,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, default=DEFAULT_CHECKPOINT)
     parser.add_argument("--context", type=int, default=6)
     parser.add_argument("--layers", type=int, default=4)
-    parser.add_argument("--steps", type=int, default=5000)
+    parser.add_argument("--steps", type=int, default=250)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=0.1)
     parser.add_argument("--noise", type=float, default=0.0)
@@ -131,7 +131,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-every", type=int, default=500)
     parser.add_argument("--eval-windows", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--prompt", default="ROMEO:\n")
+    parser.add_argument("--prompt", default="the ")
     parser.add_argument("--sample-length", type=int, default=200)
     parser.add_argument("--temperature", type=float, default=0.5)
     return parser.parse_args()
