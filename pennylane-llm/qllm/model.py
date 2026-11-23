@@ -1,19 +1,20 @@
 """Hybrid quantum next-character model.
 
-Four characters become four rotation angles, one qubit each. A PennyLane circuit
-turns that into a probability distribution over basis states, and a small linear
-layer reads those probabilities out as next-character logits.
+Each context character gets its own qubit. A learned pair of angles per character
+rotates that qubit (RY then RZ) to a point on the Bloch sphere. A PennyLane circuit
+of strongly entangling layers turns the state into a probability distribution over
+basis states, and a linear layer reads those probabilities out as next-character
+logits.
 """
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 
 import pennylane as qml
 import torch
 from torch import nn
-
-from qllm.data import window_features
 
 
 class QuantumLanguageModel(nn.Module):
@@ -24,6 +25,12 @@ class QuantumLanguageModel(nn.Module):
         self.n_layers = n_layers
         self.vocab_size = vocab_size
 
+        # Column 0 is the RY angle, column 1 the RZ angle.
+        self.angles = nn.Embedding(vocab_size, 2)
+        with torch.no_grad():
+            self.angles.weight[:, 0].uniform_(0.0, math.pi)
+            self.angles.weight[:, 1].uniform_(0.0, 2 * math.pi)
+
         shape = qml.StronglyEntanglingLayers.shape(n_layers=n_layers, n_wires=self.n_qubits)
         self.weights = nn.Parameter(0.1 * torch.randn(*shape))
         self.readout = nn.Linear(2**self.n_qubits, vocab_size)
@@ -31,23 +38,27 @@ class QuantumLanguageModel(nn.Module):
         wires = list(range(self.n_qubits))
         device = qml.device("default.qubit", wires=self.n_qubits)
 
-        def circuit(features: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-            # features: (batch, n_qubits), one angle per context character
-            qml.AngleEmbedding(features, wires=wires, rotation="Y")
+        def circuit(theta: torch.Tensor, phi: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+            # theta, phi: (batch, n_qubits), one angle pair per context character
+            qml.AngleEmbedding(theta, wires=wires, rotation="Y")
+            qml.AngleEmbedding(phi, wires=wires, rotation="Z")
             qml.StronglyEntanglingLayers(weights, wires=wires)
             return qml.probs(wires=wires)
 
         self.circuit = qml.QNode(circuit, device, interface="torch", diff_method="backprop")
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """Return logits over the vocabulary. Shape (batch, vocab_size)."""
-        probabilities = self.circuit(features, self.weights)
+    def forward(self, char_ids: torch.Tensor) -> torch.Tensor:
+        """Map (batch, context_len) character ids to (batch, vocab_size) logits."""
+        angles = self.angles(char_ids)
+        probabilities = self.circuit(angles[..., 0], angles[..., 1], self.weights)
         return self.readout(probabilities.float())
 
-    def parameter_count(self) -> tuple[int, int]:
+    def parameter_count(self) -> tuple[int, int, int]:
+        """Return (embedding, quantum, readout) parameter counts."""
+        embedding = int(self.angles.weight.numel())
         quantum = int(self.weights.numel())
-        classical = sum(parameter.numel() for parameter in self.readout.parameters())
-        return quantum, int(classical)
+        readout = sum(parameter.numel() for parameter in self.readout.parameters())
+        return embedding, quantum, int(readout)
 
 
 @torch.no_grad()
@@ -75,9 +86,8 @@ def generate(
 
     pieces: list[str] = []
     for _ in range(length):
-        window = ids[-model.context_len :]
-        features = window_features(window, model.vocab_size)
-        logits = model(features)[0]
+        window = torch.tensor([ids[-model.context_len :]], dtype=torch.long)
+        logits = model(window)[0]
         if greedy:
             nxt = int(torch.argmax(logits).item())
         else:
